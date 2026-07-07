@@ -40,6 +40,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/notify"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -183,6 +184,15 @@ files from the webdav server then you can try this option.
 `,
 				Advanced: true,
 				Default:  false,
+			}, {
+				Name: "desktop_notify",
+				Help: `Enable desktop notifications for HTTP errors.
+
+If set, rclone will send a desktop notification when a WebDAV HTTP
+error is encountered (e.g. 403 Forbidden, 507 Insufficient Storage).
+`,
+				Default:  true,
+				Advanced: true,
 			}},
 	})
 }
@@ -203,6 +213,7 @@ type Options struct {
 	ExcludeMounts      bool                 `config:"owncloud_exclude_mounts"`
 	UnixSocket         string               `config:"unix_socket"`
 	AuthRedirect       bool                 `config:"auth_redirect"`
+	DesktopNotify      bool                 `config:"desktop_notify"`
 }
 
 // Fs represents a remote webdav
@@ -297,6 +308,42 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
+// handleHTTPError processes HTTP errors from WebDAV API calls.
+// It logs the error at the appropriate level, sends desktop notifications
+// when enabled, and returns a mapped sentinel error for known status codes.
+func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op string) error {
+	apiErr, ok := err.(*api.Error)
+	if !ok {
+		return err
+	}
+	switch apiErr.StatusCode {
+	case http.StatusForbidden:
+		fs.Errorf(ctx, "%s: 权限被拒绝 (403 Forbidden): %s (op=%s)", remote, apiErr.Message, op)
+		if f.opt.DesktopNotify {
+			notify.SendAlert("rclone - 权限被拒绝", remote+": "+apiErr.Message)
+		}
+		return fs.ErrorPermissionDenied
+	case http.StatusLocked:
+		fs.Logf(ctx, "%s: 文件被锁定 (423 Locked): %s (op=%s)", remote, apiErr.Message, op)
+		if f.opt.DesktopNotify {
+			notify.Send("rclone - 文件被锁定", remote+": "+apiErr.Message)
+		}
+		return err
+	case http.StatusInsufficientStorage:
+		fs.Errorf(ctx, "%s: 存储空间不足 (507 Insufficient Storage): %s (op=%s)", remote, apiErr.Message, op)
+		if f.opt.DesktopNotify {
+			notify.SendAlert("rclone - 存储空间不足", remote+": "+apiErr.Message)
+		}
+		return fs.ErrorQuotaExceeded
+	case http.StatusNotFound:
+		fs.Debugf(ctx, "%s: 未找到 (404 Not Found): %s (op=%s)", remote, apiErr.Message, op)
+		return err
+	default:
+		fs.Debugf(ctx, "%s: HTTP error %d: %s (op=%s)", remote, apiErr.StatusCode, apiErr.Message, op)
+		return err
+	}
+}
+
 // safeRoundTripper is a wrapper for http.RoundTripper that serializes
 // http roundtrips. NTLM authentication sequence can involve up to four
 // rounds of negotiations and might fail due to concurrency.
@@ -364,6 +411,10 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Pr
 		return f.shouldRetry(ctx, resp, err)
 	})
 	if apiErr, ok := err.(*api.Error); ok {
+		// Handle HTTP errors with notifications
+		if mappedErr := f.handleHTTPError(ctx, err, path, "readMetaData"); mappedErr != err {
+			return nil, mappedErr
+		}
 		// does not exist
 		switch apiErr.StatusCode {
 		case http.StatusNotFound:
@@ -812,6 +863,10 @@ func (f *Fs) listAll(ctx context.Context, dir string, directoriesOnly bool, file
 	})
 	if err != nil {
 		if apiErr, ok := err.(*api.Error); ok {
+			// Handle HTTP errors with notifications
+			if mappedErr := f.handleHTTPError(ctx, err, dir, "listAll"); mappedErr != err {
+				return found, mappedErr
+			}
 			// does not exist
 			if apiErr.StatusCode == http.StatusNotFound {
 				if f.retryWithZeroDepth && depth != "0" {
@@ -1039,6 +1094,10 @@ func (f *Fs) _mkdir(ctx context.Context, dirPath string) error {
 		return f.shouldRetry(ctx, resp, err)
 	})
 	if apiErr, ok := err.(*api.Error); ok {
+		// Handle HTTP errors with notifications
+		if mappedErr := f.handleHTTPError(ctx, err, dirPath, "Mkdir"); mappedErr != err {
+			return mappedErr
+		}
 		// Check if it already exists. The response code for this isn't
 		// defined in the RFC so the implementations vary wildly.
 		//
@@ -1063,6 +1122,10 @@ func (f *Fs) mkdir(ctx context.Context, dirPath string) (err error) {
 	// defer log.Trace(dirPath, "")("err=%v", &err)
 	err = f._mkdir(ctx, dirPath)
 	if apiErr, ok := err.(*api.Error); ok {
+		// Handle HTTP errors with notifications
+		if mappedErr := f.handleHTTPError(ctx, err, dirPath, "Mkdir"); mappedErr != err {
+			return mappedErr
+		}
 		// parent does not exist so create it first then try again
 		if apiErr.StatusCode == http.StatusConflict {
 			err = f.mkParentDir(ctx, dirPath)
@@ -1124,6 +1187,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		err = f.handleHTTPError(ctx, err, dir, "purgeCheck")
 		return fmt.Errorf("rmdir failed: %w", err)
 	}
 	// FIXME parse Multistatus response
@@ -1189,6 +1253,7 @@ func (f *Fs) copyOrMove(ctx context.Context, src fs.Object, remote string, metho
 		return srcFs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		err = srcFs.handleHTTPError(ctx, err, src.Remote(), "copyOrMove")
 		return nil, fmt.Errorf("copy call failed: %w", err)
 	}
 	dstObj, err := f.NewObject(ctx, remote)
@@ -1293,6 +1358,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return srcFs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
+		err = srcFs.handleHTTPError(ctx, err, srcRemote, "DirMove")
 		return fmt.Errorf("DirMove MOVE call failed: %w", err)
 	}
 	return nil
@@ -1490,6 +1556,10 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		})
 		if err != nil {
 			if apiErr, ok := err.(*api.Error); ok {
+				// Handle HTTP errors with notifications
+				if mappedErr := o.fs.handleHTTPError(ctx, err, o.remote, "SetModTime"); mappedErr != err {
+					return mappedErr
+				}
 				// does not exist
 				if apiErr.StatusCode == http.StatusNotFound {
 					return fs.ErrorObjectNotFound
@@ -1646,6 +1716,7 @@ func (o *Object) updateSimple(ctx context.Context, body io.Reader, getBody func(
 		time.Sleep(1 * time.Second)
 		// Remove failed upload
 		_ = o.Remove(ctx)
+		err = o.fs.handleHTTPError(ctx, err, o.remote, "updateSimple")
 		return err
 	}
 	return nil
@@ -1658,10 +1729,14 @@ func (o *Object) Remove(ctx context.Context) error {
 		Path:       o.filePath(),
 		NoResponse: true,
 	}
-	return o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.Call(ctx, &opts)
 		return o.fs.shouldRetry(ctx, resp, err)
 	})
+	if err != nil {
+		return o.fs.handleHTTPError(ctx, err, o.remote, "Remove")
+	}
+	return nil
 }
 
 // Check the interfaces are satisfied

@@ -47,6 +47,7 @@ var (
 	ErrorDirectoryNotEmpty           = errors.New("directory not empty")
 	ErrorImmutableModified           = errors.New("immutable file modified")
 	ErrorPermissionDenied            = errors.New("permission denied")
+	ErrorQuotaExceeded               = errors.New("storage quota exceeded")
 	ErrorCantShareDirectories        = errors.New("this backend can't share directories with link")
 	ErrorNotImplemented              = errors.New("optional feature not implemented")
 	ErrorCommandNotFound             = errors.New("command not found")
