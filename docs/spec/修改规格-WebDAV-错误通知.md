@@ -137,18 +137,21 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 
 ## 5. 依赖
 
-新增依赖 `github.com/gen2brain/beeep v0.11.2`，及其传递依赖：
+新增依赖 `github.com/gen2brain/beeep v0.11.2`，及其传递依赖（以下为 `go.mod` 中实际锁定的版本）：
 
 ```
-github.com/gen2brain/beeep
-├── git.sr.ht/~jackmordaunt/go-toast    (Windows Toast)
-├── github.com/esiqveland/notify        (Linux D-Bus)
-├── github.com/godbus/dbus/v5           (D-Bus 通信)
-├── github.com/tadvi/systray            (Windows 7 托盘)
-├── github.com/sergeymakinen/go-ico     (图标转换)
-├── github.com/jackmordaunt/icns/v3     (macOS 图标)
-└── golang.org/x/sys/windows/registry   (Windows 版本检测)
+github.com/gen2brain/beeep v0.11.2
+├── git.sr.ht/~jackmordaunt/go-toast v1.1.2      (Windows Toast 通知)
+│   ├── github.com/jackmordaunt/icns/v3 v3.0.1   (macOS ICNS 图标编码)
+│   └── github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646  (图标缩放)
+├── github.com/esiqveland/notify v0.13.3          (Linux D-Bus 通知)
+│   └── github.com/godbus/dbus/v5 v5.1.0          (D-Bus 通信)
+├── github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af  (Windows 7 托盘回退)
+└── github.com/sergeymakinen/go-ico v1.0.0-beta.0 (ICO 图标编码)
+    └── github.com/sergeymakinen/go-bmp v1.0.0    (BMP 格式编码)
 ```
+
+> **注**：`golang.org/x/sys` 已在 `go.mod` 中存在（`v0.45.0`），并非本次新增。
 
 所有依赖为 **纯 Go**，无 CGO 要求，静态编译进单一二进制文件。
 
