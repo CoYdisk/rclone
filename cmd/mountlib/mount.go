@@ -392,6 +392,7 @@ func (m *MountPoint) Mount() (mountDaemon *os.Process, err error) {
 	if actualMountpoint != "" {
 		m.MountPoint = actualMountpoint
 	}
+	AutoUnmountOnFailure(m.Fs, m.UnmountFn) // 🏢 悦库修改: 注册重试耗尽自动卸载
 	m.MountedOn = time.Now()
 	return nil, nil
 }
