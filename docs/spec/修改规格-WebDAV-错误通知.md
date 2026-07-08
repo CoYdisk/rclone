@@ -32,8 +32,29 @@ func SendAlert(title, message string)
 
 **特性**:
 - 通知失败时静默处理（仅 DEBUG 日志记录），不影响主流程
-- 跨平台：Windows Toast/托盘气泡、Linux D-Bus/notify-send、macOS osascript
+- 跨平台：Windows Toast/托盘气泡、Linux D-Bus/notify-send、macOS terminal-notifier → osascript 回退
 - 使用 beeep 库实现，无 CGO 依赖
+- `init()` 中设置 `beeep.AppName = "网盘"`，通知来源显示为 "网盘"（影响 Linux D-Bus/notify-send、macOS terminal-notifier、Windows Toast 的各平台 AppID/分组名）
+- 内嵌 rclone logo（`graphics/logo/favicon/favicon_32px.png`，base64 编码，解码后传给 beeep 作为通知图标），解码失败时回退空字符串
+- 通知文本使用中文（标题如 "网盘 - 权限被拒绝"，消息体中的路径和错误详情经过 `sanitizeNotifyMsg` 清洗后再展示）
+
+**实现细节**:
+```go
+func init() {
+    beeep.AppName = "网盘"
+    rcloneIcon, _ = base64.StdEncoding.DecodeString(rcloneIconBase64)
+}
+```
+
+- `rcloneIconBase64` 常量包含 base64 编码的 32x32 PNG 图标
+- `rcloneIcon` 是解码后的 `[]byte`，传给 `beeep.Notify/Alert` 的 icon 参数
+- 各平台图标处理：
+  - macOS terminal-notifier：PNG → ICNS 转换后显示
+  - macOS osascript：不使用图标（通知正常显示）
+  - Windows Toast：直接使用 PNG 路径
+  - Windows 7 balloon：PNG → ICO 转换后显示
+  - Linux D-Bus：解码为 RGBA 图像数据
+  - Linux notify-send：使用 PNG 文件路径
 
 **依赖**: `github.com/gen2brain/beeep`
 
@@ -91,7 +112,35 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 
 桌面通知仅在 `f.opt.DesktopNotify == true` 时发送。
 
-#### 3.2.4 修改的操作函数
+**消息提取与清洗逻辑**:
+
+1. 优先使用 `apiErr.Message`（服务端返回的 `<s:message>` XML 元素）
+2. 当 `apiErr.Message` 为空时，使用 `apiErr.Error()` — 该函数依次拼接 `Message` → `Exception` → `Status`，若全部为空则返回 `"Webdav Error"`
+3. 终端日志使用原始 `detailMsg`（保留完整调试信息）
+4. 桌面通知使用 `sanitizeNotifyMsg(remote + ": " + detailMsg)` 清洗后的文本（详见 §3.2.6）
+
+这样确保：
+- 终端日志中始终有完整的服务器返回信息，便于故障排查
+- 桌面通知中的路径和错误消息干净可读，不会出现 XML 标签或 URL 编码乱码
+
+#### 3.2.4 修改方法: `errorHandler`
+
+**位置**: `NewFs` 中通过 `f.srv.SetErrorHandler(errorHandler)` 注册。
+
+**原有行为**: 解析服务端错误响应，仅当 XML 解析失败时将原始 body 作为 `Message`。
+
+**新增行为**: 即使 XML 解析成功，如果 `Message` 字段仍为空（服务端使用了非标准的错误 XML 格式，如 `<D:responsedescription>` 或无 namespace 前缀的 `<message>`），也回退使用原始响应 body 作为 `Message`。
+
+```go
+// 新增回退逻辑：XML 解析成功但 Message 为空时，使用原始 body
+if errResponse.Message == "" {
+    errResponse.Message = strings.TrimSpace(string(body))
+}
+```
+
+这样无论 WebDAV 服务端使用何种错误响应格式（SabreDAV 的 `<s:message>`、纯文本、HTML、非标准 XML），`apiErr.Message` 始终包含服务端返回的信息。
+
+#### 3.2.5 修改的操作函数
 
 以下函数增加了 `handleHTTPError` 调用，将 HTTP 错误映射为语义化错误并发送通知：
 
@@ -107,6 +156,32 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 | `DirMove` | MOVE 移动目录 | 无专门处理 | 403 → PermissionDenied + 通知 |
 | `SetModTime` | PROPPATCH 修改时间 | 404 → ObjectNotFound | 403 → PermissionDenied + 通知 |
 | `purgeCheck` | DELETE 删除目录 | 无专门处理 | 403 → PermissionDenied + 通知 |
+
+#### 3.2.6 新增方法: `sanitizeNotifyMsg`
+
+```go
+func sanitizeNotifyMsg(raw string) string
+```
+
+**用途**: 清洗服务端错误消息和文件路径，使其适合在桌面气泡通知中显示。
+
+**位置**: `handleHTTPError` 之前，作为包级函数。
+
+**处理流程**（按顺序执行）:
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1. 去除 XML/HTML 标签 | 正则 `<[^>]*>` 匹配并移除 | 服务端错误响应体常包含 `<D:error>`、`<s:message>` 等 XML 标签 |
+| 2. 压缩空白字符 | `strings.Fields` + `strings.Join` | 换行、制表符、连续空格 → 单个空格 |
+| 3. URL 解码 | 优先 `url.PathUnescape`，回退 `url.QueryUnescape`，循环最多 3 次 | 处理 `%E5%8D%8F` → `协`、双重编码 `%25E5%258D%258F` 等情况 |
+| 4. 截断超长内容 | 超过 256 字符截断并追加 `...` | Windows 气泡通知最大约 256 字符 |
+| 5. 空内容回退 | 清洗后为空则返回 `"(无详细信息)"` | 确保通知始终有内容可显示 |
+
+**设计要点**:
+
+- **`url.PathUnescape` 优先**：不会将 `+` 误当作空格（WebDAV 文件路径中 `+` 是合法字符），比 `QueryUnescape` 更适合作路径解码
+- **双重编码处理**：某些代理/中间件会对 URL 做二次编码（`%` → `%25`），循环解码确保还原原始文本
+- **仅用于通知**：终端日志仍使用原始 `detailMsg`，保留完整调试信息
 
 ---
 
@@ -129,9 +204,11 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 
 当 `desktop_notify = true`（默认）时：
 
-- **403**: 🔴 "rclone - 权限被拒绝" + 提示音
-- **423**: 🔵 "rclone - 文件被锁定" 无声通知
-- **507**: 🔴 "rclone - 存储空间不足" + 提示音
+- **403**: 🔴 "网盘 - 权限被拒绝" + 提示音
+- **423**: 🔵 "网盘 - 文件被锁定" 无声通知
+- **507**: 🔴 "网盘 - 存储空间不足" + 提示音
+
+通知消息体格式为 `文件路径: 错误详情`，其中路径和详情均经过 `sanitizeNotifyMsg` 清洗（去除 XML 标签、URL 解码、截断），确保在 Windows 气泡/Linux 通知/macOS 通知中正常显示中文。
 
 ---
 
@@ -157,7 +234,7 @@ github.com/gen2brain/beeep v0.11.2
 
 ---
 
-## 7. 配置
+## 6. 配置
 
 用户在 `rclone config` 中配置 WebDAV 远端时，可通过 `desktop_notify` 选项控制：
 
