@@ -316,30 +316,39 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 	if !ok {
 		return err
 	}
+
+	// Build the detail message for terminal log and desktop notification.
+	// Prefer the server's Message field; fall back to the full Error() string
+	// (which includes Message, Exception, and Status) when Message is empty.
+	detailMsg := apiErr.Message
+	if detailMsg == "" {
+		detailMsg = apiErr.Error()
+	}
+
 	switch apiErr.StatusCode {
 	case http.StatusForbidden:
-		fs.Errorf(ctx, "%s: 权限被拒绝 (403 Forbidden): %s (op=%s)", remote, apiErr.Message, op)
+		fs.Errorf(ctx, "%s: 权限被拒绝 (403 Forbidden): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("rclone - 权限被拒绝", remote+": "+apiErr.Message)
+			notify.SendAlert("rclone - 权限被拒绝", remote+": "+detailMsg)
 		}
 		return fs.ErrorPermissionDenied
 	case http.StatusLocked:
-		fs.Logf(ctx, "%s: 文件被锁定 (423 Locked): %s (op=%s)", remote, apiErr.Message, op)
+		fs.Logf(ctx, "%s: 文件被锁定 (423 Locked): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.Send("rclone - 文件被锁定", remote+": "+apiErr.Message)
+			notify.Send("rclone - 文件被锁定", remote+": "+detailMsg)
 		}
 		return err
 	case http.StatusInsufficientStorage:
-		fs.Errorf(ctx, "%s: 存储空间不足 (507 Insufficient Storage): %s (op=%s)", remote, apiErr.Message, op)
+		fs.Errorf(ctx, "%s: 存储空间不足 (507 Insufficient Storage): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("rclone - 存储空间不足", remote+": "+apiErr.Message)
+			notify.SendAlert("rclone - 存储空间不足", remote+": "+detailMsg)
 		}
 		return fs.ErrorQuotaExceeded
 	case http.StatusNotFound:
-		fs.Debugf(ctx, "%s: 未找到 (404 Not Found): %s (op=%s)", remote, apiErr.Message, op)
+		fs.Debugf(ctx, "%s: 未找到 (404 Not Found): %s (op=%s)", remote, detailMsg, op)
 		return err
 	default:
-		fs.Debugf(ctx, "%s: HTTP error %d: %s (op=%s)", remote, apiErr.StatusCode, apiErr.Message, op)
+		fs.Debugf(ctx, "%s: HTTP error %d: %s (op=%s)", remote, apiErr.StatusCode, detailMsg, op)
 		return err
 	}
 }
