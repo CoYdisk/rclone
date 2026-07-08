@@ -9,7 +9,7 @@ import (
 )
 
 func init() {
-	beeep.AppName = "rclone"
+	beeep.AppName = "网盘"
 
 	var err error
 	rcloneIcon, err = base64.StdEncoding.DecodeString(rcloneIconBase64)

@@ -308,6 +308,43 @@ func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (b
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
+// xmlTagRE matches XML/HTML tags for stripping from notification messages.
+var xmlTagRE = regexp.MustCompile(`<[^>]*>`)
+
+// sanitizeNotifyMsg cleans up a server error message for desktop notification display.
+// It strips XML/HTML tags, URL-decodes percent-encoded sequences (including
+// double-encoded ones), collapses whitespace, and truncates to a reasonable
+// length suitable for bubble notifications.
+func sanitizeNotifyMsg(raw string) string {
+	// Strip XML/HTML tags
+	s := xmlTagRE.ReplaceAllString(raw, "")
+	// Collapse whitespace (newlines, tabs, multiple spaces → single space)
+	s = strings.Join(strings.Fields(s), " ")
+	// URL-decode percent-encoded sequences (e.g. %E5%8D%8F → 协).
+	// Try PathUnescape first (correct for URL paths, does not treat + as space),
+	// then fall back to QueryUnescape. Loop until no more %XX patterns remain
+	// to handle double-encoded content.
+	for i := 0; i < 3; i++ {
+		decoded, err := url.PathUnescape(s)
+		if err != nil {
+			decoded, err = url.QueryUnescape(s)
+		}
+		if err != nil || decoded == s {
+			break
+		}
+		s = decoded
+	}
+	// Truncate to a reasonable notification length (Windows balloon max ~256 chars)
+	const maxLen = 256
+	if len(s) > maxLen {
+		s = s[:maxLen-3] + "..."
+	}
+	if s == "" {
+		s = "(无详细信息)"
+	}
+	return s
+}
+
 // handleHTTPError processes HTTP errors from WebDAV API calls.
 // It logs the error at the appropriate level, sends desktop notifications
 // when enabled, and returns a mapped sentinel error for known status codes.
@@ -317,7 +354,7 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 		return err
 	}
 
-	// Build the detail message for terminal log and desktop notification.
+	// Build the detail message for terminal log.
 	// Prefer the server's Message field; fall back to the full Error() string
 	// (which includes Message, Exception, and Status) when Message is empty.
 	detailMsg := apiErr.Message
@@ -325,23 +362,26 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 		detailMsg = apiErr.Error()
 	}
 
+	// Build a sanitized notification body (remote path + detail, both URL-decoded, XML-stripped, truncated).
+	notifyBody := sanitizeNotifyMsg(remote + ": " + detailMsg)
+
 	switch apiErr.StatusCode {
 	case http.StatusForbidden:
 		fs.Errorf(ctx, "%s: 权限被拒绝 (403 Forbidden): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("rclone - 权限被拒绝", remote+": "+detailMsg)
+			notify.SendAlert("网盘 - 权限被拒绝", notifyBody)
 		}
 		return fs.ErrorPermissionDenied
 	case http.StatusLocked:
 		fs.Logf(ctx, "%s: 文件被锁定 (423 Locked): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.Send("rclone - 文件被锁定", remote+": "+detailMsg)
+			notify.Send("网盘 - 文件被锁定", notifyBody)
 		}
 		return err
 	case http.StatusInsufficientStorage:
 		fs.Errorf(ctx, "%s: 存储空间不足 (507 Insufficient Storage): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("rclone - 存储空间不足", remote+": "+detailMsg)
+			notify.SendAlert("网盘 - 存储空间不足", notifyBody)
 		}
 		return fs.ErrorQuotaExceeded
 	case http.StatusNotFound:
@@ -463,6 +503,11 @@ func errorHandler(resp *http.Response) error {
 	err = xml.Unmarshal(body, &errResponse)
 	if err != nil {
 		// set the Message to be the body if can't parse the XML
+		errResponse.Message = strings.TrimSpace(string(body))
+	}
+	// If XML parsing succeeded but no structured message was extracted,
+	// fall back to the raw response body so the caller always has useful text.
+	if errResponse.Message == "" {
 		errResponse.Message = strings.TrimSpace(string(body))
 	}
 	errResponse.Status = resp.Status
