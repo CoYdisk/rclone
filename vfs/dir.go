@@ -18,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/notify"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"golang.org/x/text/unicode/norm"
 )
@@ -38,11 +39,21 @@ type Dir struct {
 	virtual map[string]vState // virtual directory entries - may be nil
 	sys     atomic.Value      // user defined info to be attached here
 
+	// Error caching: when a directory listing fails (e.g. server unreachable),
+	// we cache the error to avoid repeated HTTP retries that freeze the mount.
+	lastReadErr     error
+	lastReadErrTime time.Time
+
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
 
 	_virtuals atomic.Int32 // number of virtual directory entries in this directory and children
 }
+
+// dirErrorCooldown is how long to cache a directory listing error
+// before allowing a retry. This prevents rapid repeated HTTP requests
+// to a failing backend which can freeze the mount and block Explorer.
+const dirErrorCooldown = 30 * time.Second
 
 //go:generate stringer -type=vState
 
@@ -531,6 +542,15 @@ func (d *Dir) DelVirtual(leaf string) {
 // read the directory and sets d.items - must be called with the lock held
 func (d *Dir) _readDir() error {
 	when := time.Now()
+
+	// If we had a recent listing error, return the cached error
+	// immediately without making new HTTP requests. This prevents
+	// rapid repeated retries from freezing the mount when the
+	// backend is unreachable.
+	if d.lastReadErr != nil && time.Since(d.lastReadErrTime) < dirErrorCooldown {
+		return d.lastReadErr
+	}
+
 	if age, stale := d._age(when); stale {
 		if age != 0 {
 			fs.Debugf(d.path, "Re-reading directory (%v old)", age)
@@ -543,8 +563,24 @@ func (d *Dir) _readDir() error {
 		// We treat directory not found as empty because we
 		// create directories on the fly
 	} else if err != nil {
+		// Cache the error to prevent rapid retries
+		isFirstErr := d.lastReadErr == nil || time.Since(d.lastReadErrTime) >= dirErrorCooldown
+		d.lastReadErr = err
+		d.lastReadErrTime = time.Now()
+		// Mark directory as "read" so the cache doesn't
+		// immediately trigger another listing attempt.
+		d.read = time.Now()
+		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+		// Send desktop notification on first error (or after cooldown)
+		if isFirstErr {
+			notify.SendAlert("网盘 - 目录读取失败", d.path+": "+err.Error())
+		}
 		return err
 	}
+
+	// Successfully listed — clear error cache
+	d.lastReadErr = nil
+	d.lastReadErrTime = time.Time{}
 
 	if d.vfs.Opt.BlockNormDupes { // do this only if requested, as it will have a performance hit
 		ci := fs.GetConfig(d.vfs.ctx)
