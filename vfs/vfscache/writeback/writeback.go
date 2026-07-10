@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/notify"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
@@ -372,6 +373,10 @@ func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
 			wbItem.delay = time.Duration(wb.opt.WriteBack)
 		} else {
 			fs.Errorf(wbItem.name, "vfs cache: failed to upload try #%d, will retry in %v: %v", wbItem.tries, wbItem.delay, err)
+			// Send desktop notification on first upload failure to alert the user
+			if wbItem.tries == 1 {
+				notify.SendAlert("上传失败", wbItem.name+": "+err.Error())
+			}
 		}
 		// push the item back on the queue for retry
 		wb._pushItem(wbItem)
