@@ -36,11 +36,10 @@ type Pacer struct {
 	state      State
 }
 type pacerOptions struct {
-	maxConnections int             // Maximum number of concurrent connections
-	retries        int             // Max number of retries
-	calculator     Calculator      // switchable pacing algorithm - call with mu held
-	invoker        InvokerFunc     // wrapper function used to invoke the target function
-	onMaxRetries   func(err error) // 🏢 悦库修改: 重试耗尽时的回调，用于触发自动卸载
+	maxConnections int         // Maximum number of concurrent connections
+	retries        int         // Max number of retries
+	calculator     Calculator  // switchable pacing algorithm - call with mu held
+	invoker        InvokerFunc // wrapper function used to invoke the target function
 }
 
 // InvokerFunc is the signature of the wrapper function used to invoke the
@@ -231,10 +230,6 @@ func (p *Pacer) call(fn Paced, retries int) (err error) {
 		if !retry {
 			break
 		}
-	}
-	// 🏢 悦库修改: 重试全部耗尽后通知上层（如 mount 层）触发自动卸载
-	if retry && p.onMaxRetries != nil {
-		p.onMaxRetries(err)
 	}
 	return err
 }
