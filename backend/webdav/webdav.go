@@ -283,7 +283,6 @@ var retryErrorCodes = []int{
 	423, // Locked
 	425, // Too Early
 	429, // Too Many Requests.
-	500, // Internal Server Error
 	502, // Bad Gateway
 	503, // Service Unavailable
 	504, // Gateway Timeout
@@ -376,6 +375,12 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 		fs.Logf(ctx, "%s: 文件被锁定 (423 Locked): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
 			notify.Send("网盘 - 文件被锁定", notifyBody)
+		}
+		return err
+	case http.StatusInternalServerError:
+		fs.Errorf(ctx, "%s: 服务器内部错误 (500): %s (op=%s)", remote, detailMsg, op)
+		if f.opt.DesktopNotify {
+			notify.SendAlert("网盘 - 服务器内部错误", notifyBody)
 		}
 		return err
 	case http.StatusInsufficientStorage:

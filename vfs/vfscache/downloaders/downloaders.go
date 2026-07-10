@@ -27,7 +27,9 @@ const (
 	// time between background kicks of waiters to pick up errors
 	backgroundKickerInterval = 5 * time.Second
 	// maximum number of errors before declaring dead
-	maxErrorCount = 10
+	maxErrorCount = 0
+	// time to wait after max errors before allowing a retry
+	errorCooldownDuration = 30 * time.Minute
 	// If a downloader is within this range or --buffer-size
 	// whichever is the larger, we will reuse the downloader
 	minWindow = 1024 * 1024
@@ -67,11 +69,12 @@ type Downloaders struct {
 	wg     sync.WaitGroup
 
 	// Read write
-	mu         sync.Mutex
-	dls        []*downloader
-	waiters    []waiter
-	errorCount int   // number of consecutive errors
-	lastErr    error // last error received
+	mu            sync.Mutex
+	dls           []*downloader
+	waiters       []waiter
+	errorCount    int       // number of consecutive errors
+	lastErr       error     // last error received
+	lastErrorTime time.Time // time of last error
 }
 
 // waiter is a range we are waiting for and a channel to signal when
@@ -156,6 +159,7 @@ func (dls *Downloaders) _countErrors(n int64, err error) {
 		dls.errorCount++
 		//}
 		dls.lastErr = err
+		dls.lastErrorTime = time.Now()
 		fs.Infof(dls.src, "vfs cache: downloader: error count now %d: %v", dls.errorCount, err)
 	}
 }
@@ -284,6 +288,23 @@ func (dls *Downloaders) _closeWaiters(err error) {
 // call with lock held
 func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 	// defer log.Trace(dls.src, "r=%v", r)("err=%v", &err)
+
+	// If we've exceeded the max error count, stop trying to download
+	// and return the last error immediately. This prevents an endless
+	// cycle of retries when the source file is corrupted or the server
+	// consistently returns errors (e.g. HTTP 500).
+	//
+	// After the cooldown period elapses, we allow one retry attempt so
+	// that transient server issues can recover without requiring a
+	// mount restart.
+	if dls.errorCount > maxErrorCount {
+		if time.Since(dls.lastErrorTime) < errorCooldownDuration {
+			return dls.lastErr
+		}
+		fs.Infof(dls.src, "vfs cache: downloader: cooldown elapsed, resetting error count to 0")
+		dls.errorCount = 0
+		dls.lastErr = nil
+	}
 
 	// The window includes potentially unread data in the buffer
 	window := int64(fs.GetConfig(dls.ctx).BufferSize)
