@@ -3,6 +3,7 @@ package notify
 
 import (
 	"encoding/base64"
+	"runtime"
 
 	"github.com/gen2brain/beeep"
 	"github.com/rclone/rclone/fs"
@@ -27,27 +28,37 @@ const rcloneIconBase64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACh0lEQV
 var rcloneIcon []byte
 
 // Send sends a normal desktop notification without sound.
-// Failures are silently ignored (DEBUG logged).
+// Failures are logged at ERROR level so they are visible with --verbose.
 func Send(title, message string) {
+	if runtime.GOOS == "darwin" {
+		sendDarwinNotification(title, message, false)
+		return
+	}
+
 	var icon any = ""
 	if rcloneIcon != nil {
 		icon = rcloneIcon
 	}
 	err := beeep.Notify(title, message, icon)
 	if err != nil {
-		fs.Debugf(nil, "notify: failed to send notification: %v", err)
+		fs.Errorf(nil, "notify: failed to send notification: %v", err)
 	}
 }
 
 // SendAlert sends an urgent desktop notification with sound.
-// Failures are silently ignored (DEBUG logged).
+// Failures are logged at ERROR level so they are visible with --verbose.
 func SendAlert(title, message string) {
+	if runtime.GOOS == "darwin" {
+		sendDarwinNotification(title, message, true)
+		return
+	}
+
 	var icon any = ""
 	if rcloneIcon != nil {
 		icon = rcloneIcon
 	}
 	err := beeep.Alert(title, message, icon)
 	if err != nil {
-		fs.Debugf(nil, "notify: failed to send alert notification: %v", err)
+		fs.Errorf(nil, "notify: failed to send alert notification: %v", err)
 	}
 }
