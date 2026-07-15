@@ -26,10 +26,19 @@ const (
 	maxSkipBytes = 1024 * 1024
 	// time between background kicks of waiters to pick up errors
 	backgroundKickerInterval = 5 * time.Second
-	// maximum number of errors before declaring dead
+	// maximum number of permanent errors (HTTP 500, 403, 507) before declaring dead.
+	// The spec requires 0: first permanent error immediately stops further downloads.
 	maxErrorCount = 0
-	// time to wait after max errors before allowing a retry
+	// time to wait after permanent errors before allowing a retry.
+	// The spec requires 30 minutes to cover a work session.
 	errorCooldownDuration = 30 * time.Minute
+	// maximum number of transient errors (timeout, connection refused)
+	// before entering a short cooldown to prevent infinite retry loops.
+	maxRetryErrorCount = 5
+	// time to wait after transient errors before allowing a retry.
+	// Short enough to recover from brief network glitches,
+	// long enough to prevent rapid-fire retries when the server stays down.
+	retryErrorCooldownDuration = 30 * time.Second
 	// If a downloader is within this range or --buffer-size
 	// whichever is the larger, we will reuse the downloader
 	minWindow = 1024 * 1024
@@ -69,12 +78,15 @@ type Downloaders struct {
 	wg     sync.WaitGroup
 
 	// Read write
-	mu            sync.Mutex
-	dls           []*downloader
-	waiters       []waiter
-	errorCount    int       // number of consecutive errors
-	lastErr       error     // last error received
-	lastErrorTime time.Time // time of last error
+	mu                 sync.Mutex
+	dls                []*downloader
+	waiters            []waiter
+	errorCount         int       // number of consecutive permanent errors (HTTP 500 etc.)
+	lastErr            error     // last permanent error received
+	lastErrorTime      time.Time // time of last permanent error
+	retryErrorCount    int       // number of consecutive transient errors (timeout etc.)
+	lastRetryErr       error     // last transient error received
+	lastRetryErrorTime time.Time // time of last transient error
 }
 
 // waiter is a range we are waiting for and a channel to signal when
@@ -137,7 +149,16 @@ func New(ctx context.Context, item Item, opt *vfscommon.Options, remote string, 
 	return dls
 }
 
-// Accumulate errors for this downloader
+// Accumulate errors for this downloader using a dual-track system.
+//
+// Errors are classified by fserrors.ShouldRetry():
+//   - Permanent errors (ShouldRetry=false, e.g. HTTP 500/403/507):
+//     tracked in errorCount, trigger long cooldown (30 min).
+//   - Transient errors (ShouldRetry=true, e.g. timeout, connection refused):
+//     tracked in retryErrorCount, trigger short cooldown (30 sec).
+//
+// This prevents both permanent error dead loops (spec §3.4.1)
+// and transient error infinite retry loops (server continuously down).
 //
 // It should be called with
 //
@@ -147,20 +168,29 @@ func New(ctx context.Context, item Item, opt *vfscommon.Options, remote string, 
 // call with lock held
 func (dls *Downloaders) _countErrors(n int64, err error) {
 	if err == nil && n != 0 {
-		if dls.errorCount != 0 {
-			fs.Infof(dls.src, "vfs cache: downloader: resetting error count to 0")
+		if dls.errorCount != 0 || dls.retryErrorCount != 0 {
+			fs.Infof(dls.src, "vfs cache: downloader: resetting error counts to 0")
 			dls.errorCount = 0
 			dls.lastErr = nil
+			dls.retryErrorCount = 0
+			dls.lastRetryErr = nil
 		}
 		return
 	}
 	if err != nil {
-		//if err != syscall.ENOSPC {
-		dls.errorCount++
-		//}
-		dls.lastErr = err
-		dls.lastErrorTime = time.Now()
-		fs.Infof(dls.src, "vfs cache: downloader: error count now %d: %v", dls.errorCount, err)
+		if fserrors.ShouldRetry(err) {
+			// Transient error: network timeout, connection refused, etc.
+			dls.retryErrorCount++
+			dls.lastRetryErr = err
+			dls.lastRetryErrorTime = time.Now()
+			fs.Infof(dls.src, "vfs cache: downloader: transient error count now %d: %v", dls.retryErrorCount, err)
+		} else {
+			// Permanent error: HTTP 500, 403, 507, etc.
+			dls.errorCount++
+			dls.lastErr = err
+			dls.lastErrorTime = time.Now()
+			fs.Infof(dls.src, "vfs cache: downloader: permanent error count now %d: %v", dls.errorCount, err)
+		}
 	}
 }
 
@@ -289,21 +319,35 @@ func (dls *Downloaders) _closeWaiters(err error) {
 func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 	// defer log.Trace(dls.src, "r=%v", r)("err=%v", &err)
 
-	// If we've exceeded the max error count, stop trying to download
-	// and return the last error immediately. This prevents an endless
-	// cycle of retries when the source file is corrupted or the server
-	// consistently returns errors (e.g. HTTP 500).
+	// Dual-track error cooldown check:
 	//
-	// After the cooldown period elapses, we allow one retry attempt so
-	// that transient server issues can recover without requiring a
-	// mount restart.
+	// Track 1 — Permanent errors (HTTP 500, 403, 507):
+	//   After the first permanent error (errorCount > 0), block all downloads
+	//   for 30 minutes. This prevents dead loops on corrupted files (spec §3.4.1).
+	//
+	// Track 2 — Transient errors (timeout, connection refused):
+	//   After retryErrorCount exceeds maxRetryErrorCount, block downloads
+	//   for 30 seconds. This prevents infinite retry loops while allowing
+	//   quick recovery from brief network glitches.
+
+	// Check permanent error cooldown (long: 30 min)
 	if dls.errorCount > maxErrorCount {
 		if time.Since(dls.lastErrorTime) < errorCooldownDuration {
 			return dls.lastErr
 		}
-		fs.Infof(dls.src, "vfs cache: downloader: cooldown elapsed, resetting error count to 0")
+		fs.Infof(dls.src, "vfs cache: downloader: permanent error cooldown elapsed, resetting error count to 0")
 		dls.errorCount = 0
 		dls.lastErr = nil
+	}
+
+	// Check transient error cooldown (short: 30 sec)
+	if dls.retryErrorCount > maxRetryErrorCount {
+		if time.Since(dls.lastRetryErrorTime) < retryErrorCooldownDuration {
+			return dls.lastRetryErr
+		}
+		fs.Infof(dls.src, "vfs cache: downloader: transient error cooldown elapsed, resetting retry count to 0")
+		dls.retryErrorCount = 0
+		dls.lastRetryErr = nil
 	}
 
 	// The window includes potentially unread data in the buffer
