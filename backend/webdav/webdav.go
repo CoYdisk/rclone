@@ -368,25 +368,25 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 	case http.StatusForbidden:
 		fs.Errorf(ctx, "%s: 权限被拒绝 (403 Forbidden): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("网盘 - 权限被拒绝", notifyBody)
+			notify.SendAlert("悦库企业网盘 - 权限被拒绝", notifyBody)
 		}
 		return fs.ErrorPermissionDenied
 	case http.StatusLocked:
 		fs.Logf(ctx, "%s: 文件被锁定 (423 Locked): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.Send("网盘 - 文件被锁定", notifyBody)
+			notify.Send("悦库企业网盘 - 文件被锁定", notifyBody)
 		}
 		return err
 	case http.StatusInternalServerError:
 		fs.Errorf(ctx, "%s: 服务器内部错误 (500): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("网盘 - 服务器内部错误", notifyBody)
+			notify.SendAlert("悦库企业网盘 - 服务器内部错误", notifyBody)
 		}
 		return err
 	case http.StatusInsufficientStorage:
 		fs.Errorf(ctx, "%s: 存储空间不足 (507 Insufficient Storage): %s (op=%s)", remote, detailMsg, op)
 		if f.opt.DesktopNotify {
-			notify.SendAlert("网盘 - 存储空间不足", notifyBody)
+			notify.SendAlert("悦库企业网盘 - 存储空间不足", notifyBody)
 		}
 		return fs.ErrorQuotaExceeded
 	case http.StatusNotFound:
