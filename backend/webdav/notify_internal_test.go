@@ -1,12 +1,14 @@
 // 桌面通知的回归用例（package webdav 内部测试：handleHTTPError 未导出）。
 //
 // 为什么必须有这一条：`backend/webdav` 的通知分支写在 handleHTTPError 里，而
-// **可重试**的状态码（423 Locked / 500 / 507 等）在到达这里之前已经被
-// `fs/pacer.go:pacerInvoker` 用 `fserrors.RetryError()` 包了一层；
-// 只有"不重试"的状态码（403）才是裸 `*api.Error`。
-// 于是早先那版 `err.(*api.Error)` 直接断言对重试类错误恒为 false ⇒
+// **可重试**的状态码（`backend/webdav/webdav.go#retryErrorCodes`：423 Locked / 425 / 429 /
+// 502 / 503 / 504 / 509）在到达这里之前已经被 `fs/pacer.go:pacerInvoker` 用
+// `fserrors.RetryError()` 包了一层；不重试的状态码（403 / 500 / 507）才是裸 `*api.Error`。
+// 于是早先那版 `err.(*api.Error)` 直接断言对**重试类**错误恒为 false ⇒
 // **「文件被锁定」的通知永远不会发**，而 403 一切正常（真机 A/B 就是这样：
 // 403 的横幅在 VM 上弹得出来，423 连日志行都没有）。
+// 四条状态码都按"包装/未包装"各测一遍：今天只有 423 那条在真机上会被包装，但
+// 500/507 一旦被列入重试码、或 rclone 调整重试策略，同一处断言就会再次静默失效。
 package webdav
 
 import (
@@ -29,8 +31,8 @@ func stubNotify(records *[]string) (restore func()) {
 	return func() { notifySend, notifySendAlert = oldSend, oldAlert }
 }
 
-// TestHandleHTTPErrorNotifiesRetryableStatuses 钉住"可重试错误也必须发通知"。
-// 每条都按**包装后**的错误投喂（与真机路径一致），否则只能覆盖 403。
+// TestHandleHTTPErrorNotifiesRetryableStatuses 钉住"错误被 fserrors 包装后也必须发通知"。
+// 每条都按**包装后**的错误投喂（与真机 423 的路径一致），未包装的情形一并覆盖。
 func TestHandleHTTPErrorNotifiesRetryableStatuses(t *testing.T) {
 	for _, test := range []struct {
 		name   string

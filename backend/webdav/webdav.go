@@ -357,11 +357,11 @@ var (
 // It logs the error at the appropriate level, sends desktop notifications
 // when enabled, and returns a mapped sentinel error for known status codes.
 func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op string) error {
-	// 注意：**可重试**的状态码（423 Locked / 500 / 507 …）在到达这里之前已经被
-	// `fs/pacer.go:pacerInvoker` 用 `fserrors.RetryError()` 包了一层（返回值的
-	// shouldRetry 为 true 时就会包），`fmt.Errorf("...: %w")` 也可能再包一层。
-	// 所以必须用 errors.As 穿过包装层；早先用 `err.(*api.Error)` 直接断言对这类
-	// 错误恒为 false，导致「文件被锁定」的通知从来没发出去过（只有不重试的 403 发）。
+	// 注意：**可重试**的状态码（本文件 retryErrorCodes：423 Locked / 425 / 429 / 502 / 503 /
+	// 504 / 509）在到达这里之前已经被 `fs/pacer.go:pacerInvoker` 用 `fserrors.RetryError()`
+	// 包了一层（返回值的 shouldRetry 为 true 时就会包），`fmt.Errorf("...: %w")` 也可能再包一层。
+	// 所以必须用 errors.As 穿过包装层；早先用 `err.(*api.Error)` 直接断言对这类错误恒为 false，
+	// 导致「文件被锁定」的通知从来没发出去过（不重试的 403 / 500 / 507 则一直能发）。
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) {
 		return err
