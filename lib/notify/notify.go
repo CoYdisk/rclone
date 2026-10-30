@@ -4,6 +4,8 @@ package notify
 import (
 	"encoding/base64"
 	"runtime"
+	"sync"
+	"time"
 
 	"github.com/gen2brain/beeep"
 	"github.com/rclone/rclone/fs"
@@ -15,7 +17,8 @@ func init() {
 	var err error
 	rcloneIcon, err = base64.StdEncoding.DecodeString(rcloneIconBase64)
 	if err != nil {
-		fs.Debugf(nil, "notify: failed to decode embedded icon: %v", err)
+		// 在 ERROR 级留一条：图标解不出来时通知只剩应用名，静默降级会让人以为"图标改了没生效"。
+		fs.Errorf(nil, "notify: failed to decode embedded icon: %v", err)
 	}
 }
 
@@ -27,9 +30,46 @@ const rcloneIconBase64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0
 // nil if decoding failed; Send/SendAlert will fall back to an empty string icon.
 var rcloneIcon []byte
 
+// dedupeWindow is how long an identical notification (same title+message) is
+// suppressed after it has been shown once.
+//
+// 为什么需要：一次失败的上传在 rclone 侧会走多次尝试 —— 低层重试（423/500/507 都在
+// retryErrorCodes 里）以及 updateSimple 失败后对目标的那次 `Remove`，每次都会进
+// handleHTTPError ⇒ 同一条「文件被锁定」会连弹好几个横幅（真机实测一次写入 6 条）。
+// 用户看到的应当是"这件事出错了"，而不是"出错了 6 次"。
+const dedupeWindow = 60 * time.Second
+
+var (
+	dedupeMu   sync.Mutex
+	dedupeLast = map[string]time.Time{}
+)
+
+// shouldNotify reports whether this notification should be shown, and records it.
+// 纯内部状态，供 Send/SendAlert 调用；单测直接调它（不会真弹通知）。
+func shouldNotify(title, message string, now time.Time) bool {
+	key := title + "\x00" + message
+	dedupeMu.Lock()
+	defer dedupeMu.Unlock()
+	// 顺手清掉过期的键，避免长时间运行时 map 无限增长
+	for k, t := range dedupeLast {
+		if now.Sub(t) >= dedupeWindow {
+			delete(dedupeLast, k)
+		}
+	}
+	if last, ok := dedupeLast[key]; ok && now.Sub(last) < dedupeWindow {
+		return false
+	}
+	dedupeLast[key] = now
+	return true
+}
+
 // Send sends a normal desktop notification without sound.
 // Failures are logged at ERROR level so they are visible with --verbose.
 func Send(title, message string) {
+	if !shouldNotify(title, message, time.Now()) {
+		fs.Debugf(nil, "notify: suppressed duplicate notification %q (within %v)", title, dedupeWindow)
+		return
+	}
 	if runtime.GOOS == "darwin" {
 		sendDarwinNotification(title, message, false)
 		return
@@ -48,6 +88,10 @@ func Send(title, message string) {
 // SendAlert sends an urgent desktop notification with sound.
 // Failures are logged at ERROR level so they are visible with --verbose.
 func SendAlert(title, message string) {
+	if !shouldNotify(title, message, time.Now()) {
+		fs.Debugf(nil, "notify: suppressed duplicate alert %q (within %v)", title, dedupeWindow)
+		return
+	}
 	if runtime.GOOS == "darwin" {
 		sendDarwinNotification(title, message, true)
 		return
