@@ -1141,6 +1141,9 @@ func (d *Dir) Remove() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	if err := d.vfs.checkNotReadOnly("remove directory", d.path); err != nil {
+		return err
+	}
 	// Check directory is empty first
 	empty, err := d.isEmpty()
 	if err != nil {
@@ -1168,6 +1171,9 @@ func (d *Dir) Remove() error {
 func (d *Dir) RemoveAll() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
+	}
+	if err := d.vfs.checkNotReadOnly("remove directory", d.path); err != nil {
+		return err
 	}
 	// Remove contents of the directory
 	nodes, err := d.ReadDirAll()
@@ -1197,6 +1203,9 @@ func (d *Dir) RemoveName(name string) error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	if err := d.vfs.checkNotReadOnly("remove", path.Join(d.path, name)); err != nil {
+		return err
+	}
 	// fs.Debugf(path, "Dir.Remove")
 	node, err := d.stat(name)
 	if err != nil {
@@ -1218,6 +1227,14 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	}
 	oldPath := path.Join(d.path, oldName)
 	newPath := path.Join(destDir.path, newName)
+	// Refuse to rename a read only path, or to rename anything over a
+	// read only path (this is how Office "saves" a file).
+	if err := d.vfs.checkNotReadOnly("rename", oldPath); err != nil {
+		return err
+	}
+	if err := d.vfs.checkNotReadOnly("rename over", newPath); err != nil {
+		return err
+	}
 	// fs.Debugf(oldPath, "Dir.Rename to %q", newPath)
 	oldNode, err := d.stat(oldName)
 	if err != nil {

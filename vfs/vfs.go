@@ -188,6 +188,7 @@ type VFS struct {
 	usage       *fs.Usage
 	pollChan    chan time.Duration
 	inUse       atomic.Int32 // count of number of opens
+	readOnlySet *readOnlyPaths // paths which must not be modified - may be nil
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -225,6 +226,12 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 
 	// Fill out anything else
 	vfs.Opt.Init(ctx)
+
+	// Set up the read only path set (if any)
+	vfs.readOnlySet = newReadOnlyPaths(vfs.Opt.ReadOnlyPaths)
+	if vfs.readOnlySet != nil {
+		fs.Infof(f, "vfs: read only paths loaded from %q (%d paths)", vfs.Opt.ReadOnlyPaths, vfs.readOnlySet.Len())
+	}
 
 	// Find a VFS with the same name and options and return it if possible
 	activeMu.Lock()
@@ -569,6 +576,16 @@ func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, e
 		return nil, EINVAL
 	}
 
+	// Refuse to open a read only path for writing - a read only path
+	// is one which an external agent (eg the ydisk client) has asked
+	// us not to modify, for example because the file is locked by
+	// another user.
+	if flags&accessModeMask != os.O_RDONLY || flags&os.O_TRUNC != 0 {
+		if err := vfs.checkNotReadOnly("open for write", name); err != nil {
+			return nil, err
+		}
+	}
+
 	node, err := vfs.Stat(name)
 	if err != nil {
 		if err != ENOENT || flags&os.O_CREATE == 0 {
@@ -602,8 +619,38 @@ func (vfs *VFS) Create(name string) (Handle, error) {
 	return vfs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
+// isReadOnly returns true if name is in the read only path set, ie it
+// must not be modified even though the remote may allow it.
+func (vfs *VFS) isReadOnly(name string) bool {
+	if vfs.readOnlySet == nil {
+		return false
+	}
+	return vfs.readOnlySet.Contains(name)
+}
+
+// checkNotReadOnly returns an error (and logs it) if name is in the
+// read only path set. op is used in the log message.
+func (vfs *VFS) checkNotReadOnly(op string, name string) error {
+	if !vfs.isReadOnly(name) {
+		return nil
+	}
+	fs.Errorf(name, "vfs: refusing to %s: path is read only (read only paths list)", op)
+	return EPERM
+}
+
 // Rename oldName to newName
 func (vfs *VFS) Rename(oldName, newName string) error {
+	// Refuse to rename a read only path or to rename anything over a
+	// read only path.  The latter is how Office "saves" a file: it
+	// writes a temporary file and then renames it over the original,
+	// so both ends have to be checked.
+	if err := vfs.checkNotReadOnly("rename", oldName); err != nil {
+		return err
+	}
+	if err := vfs.checkNotReadOnly("rename over", newName); err != nil {
+		return err
+	}
+
 	// find the parent directories
 	oldDir, oldLeaf, err := vfs.StatParent(oldName)
 	if err != nil {
@@ -714,6 +761,9 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 
 // Remove removes the named file or (empty) directory.
 func (vfs *VFS) Remove(name string) error {
+	if err := vfs.checkNotReadOnly("remove", name); err != nil {
+		return err
+	}
 	node, err := vfs.Stat(name)
 	if err != nil {
 		return err
@@ -731,6 +781,9 @@ func (vfs *VFS) Remove(name string) error {
 // The underlying filesystem may truncate or round the values to a less precise
 // time unit.
 func (vfs *VFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	if err := vfs.checkNotReadOnly("set modification time", name); err != nil {
+		return err
+	}
 	node, err := vfs.Stat(name)
 	if err != nil {
 		return err

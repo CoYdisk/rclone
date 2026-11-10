@@ -131,6 +131,12 @@ func (f *File) Mode() (mode os.FileMode) {
 		if f.appendMode {
 			mode |= os.ModeAppend
 		}
+		// Show files which must not be modified as read only so that
+		// applications open them read only rather than trying to write
+		// to them (and then "saving" them by replacing them).
+		if f.d.vfs.isReadOnly(f._path()) {
+			mode &^= 0222
+		}
 	}
 	return mode
 }
@@ -246,6 +252,15 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 
 	// File.mu is unlocked here to call Dir.Path()
 	newPath := path.Join(destDir.Path(), newCacheName)
+
+	// Refuse to rename a read only path, or to rename anything over a
+	// read only path (this is how Office "saves" a file).
+	if err := d.vfs.checkNotReadOnly("rename", oldPath); err != nil {
+		return err
+	}
+	if err := d.vfs.checkNotReadOnly("rename over", newPath); err != nil {
+		return err
+	}
 
 	renameCall := func(ctx context.Context) (err error) {
 		// chain rename calls if any
@@ -464,6 +479,9 @@ func (f *File) SetModTime(modTime time.Time) error {
 	if f.d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	if err := f.d.vfs.checkNotReadOnly("set modification time", f._path()); err != nil {
+		return err
+	}
 
 	f.pendingModTime = modTime
 
@@ -625,6 +643,9 @@ func (f *File) openWrite(flags int) (fh *WriteFileHandle, err error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
+	if err := d.vfs.checkNotReadOnly("open for write", f.Path()); err != nil {
+		return nil, err
+	}
 	// fs.Debugf(f.Path(), "File.openWrite")
 
 	fh, err = newWriteFileHandle(d, f, f.Path(), flags)
@@ -646,6 +667,11 @@ func (f *File) openRW(flags int) (fh *RWFileHandle, err error) {
 	// FIXME chunked
 	if flags&accessModeMask != os.O_RDONLY && d.vfs.Opt.ReadOnly {
 		return nil, EROFS
+	}
+	if flags&accessModeMask != os.O_RDONLY {
+		if err := d.vfs.checkNotReadOnly("open for write", f.Path()); err != nil {
+			return nil, err
+		}
 	}
 	// fs.Debugf(f.Path(), "File.openRW")
 
@@ -673,6 +699,9 @@ func (f *File) Remove() (err error) {
 
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
+	}
+	if err := d.vfs.checkNotReadOnly("remove", f.Path()); err != nil {
+		return err
 	}
 
 	// Remove the object from the cache

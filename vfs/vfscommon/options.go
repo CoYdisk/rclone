@@ -16,6 +16,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Don't read/write the modification time (can speed things up)",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_readonly_paths",
+	Default: "",
+	Help:    "Path to a JSON file listing paths which must not be modified (eg files locked by another user)",
+	Groups:  "VFS",
+}, {
 	Name:    "no_checksum",
 	Default: false,
 	Help:    "Don't compare checksums on up/download",
@@ -186,6 +191,7 @@ type Options struct {
 	NoSeek             bool          `config:"no_seek"`        // don't allow seeking if set
 	NoChecksum         bool          `config:"no_checksum"`    // don't check checksums if set
 	ReadOnly           bool          `config:"read_only"`      // if set VFS is read only
+	ReadOnlyPaths      string        `config:"vfs_readonly_paths"` // path to a JSON file listing paths which must not be modified
 	Links              bool          `config:"vfs_links"`      // if set interpret link files
 	NoModTime          bool          `config:"no_modtime"`     // don't read mod times for files
 	DirCacheTime       fs.Duration   `config:"dir_cache_time"` // how long to consider directory listing cache valid
