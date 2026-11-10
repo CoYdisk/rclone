@@ -38,6 +38,7 @@ import (
 	"github.com/go-git/go-billy/v5"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/rc"
@@ -228,9 +229,15 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 	vfs.Opt.Init(ctx)
 
 	// Set up the read only path set (if any)
-	vfs.readOnlySet = newReadOnlyPaths(vfs.Opt.ReadOnlyPaths)
+	readOnlyPathsFile := vfs.Opt.ReadOnlyPaths
+	if readOnlyPathsFile == "" {
+		// Default to a manifest next to the rclone config file if there is
+		// one - see defaultReadOnlyPathsFile.
+		readOnlyPathsFile = defaultReadOnlyPathsFile(config.GetConfigPath())
+	}
+	vfs.readOnlySet = newReadOnlyPaths(readOnlyPathsFile)
 	if vfs.readOnlySet != nil {
-		fs.Infof(f, "vfs: read only paths loaded from %q (%d paths)", vfs.Opt.ReadOnlyPaths, vfs.readOnlySet.Len())
+		fs.Infof(f, "vfs: read only paths loaded from %q (%d paths)", readOnlyPathsFile, vfs.readOnlySet.Len())
 	}
 
 	// Find a VFS with the same name and options and return it if possible

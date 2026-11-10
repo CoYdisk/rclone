@@ -276,3 +276,18 @@ func TestReadOnlyPathsContainsUnder(t *testing.T) {
 	assert.False(t, r.ContainsUnder(""), "the root is never protected")
 	assert.False(t, r.Contains("dir"), "parent dirs are not themselves protected")
 }
+
+// TestDefaultReadOnlyPathsFile checks the "manifest next to the rclone
+// config" default: it is only used when the file actually exists.
+func TestDefaultReadOnlyPathsFile(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "rclone.conf")
+	require.NoError(t, os.WriteFile(configPath, []byte("[ydisk-webdav]\n"), 0600))
+
+	assert.Equal(t, "", defaultReadOnlyPathsFile(configPath), "no manifest => not enabled")
+	assert.Equal(t, "", defaultReadOnlyPathsFile(""), "no config path => not enabled")
+
+	manifest := filepath.Join(dir, readOnlyPathsFileName)
+	require.NoError(t, os.WriteFile(manifest, []byte(`{"paths":["a/b.docx"]}`), 0600))
+	assert.Equal(t, manifest, defaultReadOnlyPathsFile(configPath))
+}

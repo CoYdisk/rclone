@@ -3,6 +3,7 @@ package vfs
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,28 @@ import (
 // checked for changes. The file is only re-read if its modification
 // time or size changed.
 const readOnlyPathsReloadInterval = 500 * time.Millisecond
+
+// readOnlyPathsFileName is the name of the manifest which is picked up
+// by default from the directory holding the rclone config file.
+const readOnlyPathsFileName = "readonly-paths.json"
+
+// defaultReadOnlyPathsFile returns <dir(configPath)>/readonly-paths.json
+// if configPath is set and that file exists, or "" if it doesn't.
+//
+// This lets a program which drives rclone (the ydisk client passes
+// --config <userData>/rclone/rclone.conf) turn the feature on just by
+// writing the manifest, without having to be able to change rclone's
+// arguments too.
+func defaultReadOnlyPathsFile(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	candidate := filepath.Join(filepath.Dir(configPath), readOnlyPathsFileName)
+	if _, err := os.Stat(candidate); err != nil {
+		return ""
+	}
+	return candidate
+}
 
 // readOnlyPathsManifest is the on disk format of the read only paths
 // file.
