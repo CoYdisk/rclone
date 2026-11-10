@@ -195,3 +195,84 @@ func TestVFSReadOnlyPathsNoList(t *testing.T) {
 	require.NoError(t, fd.Close())
 	assert.NoError(t, v.Remove("dir/file.txt"))
 }
+
+// TestVFSReadOnlyPathsSiblings checks that protecting one file does not
+// affect the other files in the same directory - that was the obvious
+// risk with a "make this path read only" feature.
+func TestVFSReadOnlyPathsSiblings(t *testing.T) {
+	const locked = "dir/locked.docx"
+
+	r, v := newTestReadOnlyVFS(t, locked)
+	for _, name := range []string{locked, "dir/siblingA.txt", "dir/siblingB.txt", "dir/sub/deep.txt", "top.txt"} {
+		r.WriteObject(context.Background(), name, "hello "+name, time.Now())
+	}
+
+	// Siblings can be opened for write, truncated, removed and renamed
+	fd, err := v.OpenFile("dir/siblingA.txt", os.O_RDWR, 0666)
+	require.NoError(t, err)
+	require.NoError(t, fd.Close())
+	require.NoError(t, v.Remove("dir/siblingA.txt"))
+
+	fd, err = v.OpenFile("dir/siblingB.txt", os.O_RDWR|os.O_TRUNC, 0666)
+	require.NoError(t, err)
+	require.NoError(t, fd.Close())
+	require.NoError(t, v.Rename("dir/siblingB.txt", "dir/siblingB2.txt"))
+	require.NoError(t, v.Chtimes("dir/siblingB2.txt", time.Now(), time.Now()))
+
+	// Files in sub directories and at the top level are unaffected too
+	require.NoError(t, v.Remove("dir/sub/deep.txt"))
+	require.NoError(t, v.Mkdir("dir/newdir", 0777))
+	require.NoError(t, v.Remove("top.txt"))
+
+	// A sibling's mode still has its write bits
+	node, err := v.Stat("dir/siblingB2.txt")
+	require.NoError(t, err)
+	assert.NotZero(t, node.(*File).Mode().Perm()&0200)
+
+	// The locked file itself is still protected
+	_, err = v.OpenFile(locked, os.O_RDWR, 0666)
+	assert.ErrorIs(t, err, EPERM)
+	assert.ErrorIs(t, v.Remove(locked), EPERM)
+}
+
+// TestVFSReadOnlyPathsParentDir checks that operations which affect a
+// whole subtree containing a protected path are refused as a whole, so a
+// "delete this folder" cannot delete the protected file as a side
+// effect (or delete half the folder before failing on it).
+func TestVFSReadOnlyPathsParentDir(t *testing.T) {
+	r, v := newTestReadOnlyVFS(t, "dir/sub/locked.docx")
+	r.WriteObject(context.Background(), "dir/sub/locked.docx", "locked", time.Now())
+	r.WriteObject(context.Background(), "dir/sub/other.txt", "other", time.Now())
+	r.WriteObject(context.Background(), "dir/other2.txt", "other2", time.Now())
+
+	// Removing or renaming a parent directory of a protected path is refused
+	assert.ErrorIs(t, v.Remove("dir/sub"), EPERM, "parent dir remove must be refused")
+	assert.ErrorIs(t, v.Remove("dir"), EPERM, "grandparent dir remove must be refused")
+	assert.ErrorIs(t, v.Rename("dir/sub", "dir/moved"), EPERM, "parent dir rename must be refused")
+	assert.ErrorIs(t, v.Rename("dir", "moved"), EPERM)
+
+	// Nothing was deleted as a side effect
+	for _, name := range []string{"dir/sub/locked.docx", "dir/sub/other.txt", "dir/other2.txt"} {
+		node, err := v.Stat(name)
+		require.NoError(t, err, "%s must still exist", name)
+		assert.False(t, node.IsDir())
+	}
+
+	// Other directories are unaffected
+	require.NoError(t, v.MkdirAll("other/deeper", 0777))
+	require.NoError(t, v.Remove("other/deeper"))
+	require.NoError(t, v.Remove("other"))
+}
+
+// TestReadOnlyPathsContainsUnder checks the subtree matching rules.
+func TestReadOnlyPathsContainsUnder(t *testing.T) {
+	r := newReadOnlyPaths(writeReadOnlyPathsFile(t, "dir/sub/locked.docx"))
+
+	assert.True(t, r.ContainsUnder("dir/sub/locked.docx"))
+	assert.True(t, r.ContainsUnder("dir/sub"))
+	assert.True(t, r.ContainsUnder("dir"))
+	assert.False(t, r.ContainsUnder("dir/sub2"), "a name with the same prefix is a different path")
+	assert.False(t, r.ContainsUnder("other"))
+	assert.False(t, r.ContainsUnder(""), "the root is never protected")
+	assert.False(t, r.Contains("dir"), "parent dirs are not themselves protected")
+}

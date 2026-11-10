@@ -255,7 +255,7 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 
 	// Refuse to rename a read only path, or to rename anything over a
 	// read only path (this is how Office "saves" a file).
-	if err := d.vfs.checkNotReadOnly("rename", oldPath); err != nil {
+	if err := d.vfs.checkNotReadOnlyUnder("rename", oldPath); err != nil {
 		return err
 	}
 	if err := d.vfs.checkNotReadOnly("rename over", newPath); err != nil {

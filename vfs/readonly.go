@@ -149,6 +149,36 @@ func (r *readOnlyPaths) Contains(name string) bool {
 	return found
 }
 
+// ContainsUnder returns true if name is in the read only set **or** is a
+// parent directory of a path in the read only set.
+//
+// This is used for operations which affect a whole subtree (remove a
+// directory, rename a directory): those must be refused too, otherwise
+// deleting the parent directory would delete the protected file with it
+// (or, worse, delete half of the directory before failing on it).
+func (r *readOnlyPaths) ContainsUnder(name string) bool {
+	if r == nil {
+		return false
+	}
+	name = cleanReadOnlyPath(name)
+	if name == "" {
+		return false // the root is never protected
+	}
+	prefix := name + "/"
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reload(time.Now())
+	if _, found := r.set[name]; found {
+		return true
+	}
+	for p := range r.set {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // Len returns the number of paths in the read only set (after
 // reloading it).
 func (r *readOnlyPaths) Len() int {

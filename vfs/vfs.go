@@ -628,10 +628,30 @@ func (vfs *VFS) isReadOnly(name string) bool {
 	return vfs.readOnlySet.Contains(name)
 }
 
+// isReadOnlyUnder returns true if name is in the read only path set or
+// is a parent directory of something in it - used for operations which
+// affect a whole subtree (removing or renaming a directory).
+func (vfs *VFS) isReadOnlyUnder(name string) bool {
+	if vfs.readOnlySet == nil {
+		return false
+	}
+	return vfs.readOnlySet.ContainsUnder(name)
+}
+
 // checkNotReadOnly returns an error (and logs it) if name is in the
 // read only path set. op is used in the log message.
 func (vfs *VFS) checkNotReadOnly(op string, name string) error {
 	if !vfs.isReadOnly(name) {
+		return nil
+	}
+	fs.Errorf(name, "vfs: refusing to %s: path is read only (read only paths list)", op)
+	return EPERM
+}
+
+// checkNotReadOnlyUnder is like checkNotReadOnly but also refuses paths
+// which are parent directories of a read only path.
+func (vfs *VFS) checkNotReadOnlyUnder(op string, name string) error {
+	if !vfs.isReadOnlyUnder(name) {
 		return nil
 	}
 	fs.Errorf(name, "vfs: refusing to %s: path is read only (read only paths list)", op)
@@ -644,7 +664,7 @@ func (vfs *VFS) Rename(oldName, newName string) error {
 	// read only path.  The latter is how Office "saves" a file: it
 	// writes a temporary file and then renames it over the original,
 	// so both ends have to be checked.
-	if err := vfs.checkNotReadOnly("rename", oldName); err != nil {
+	if err := vfs.checkNotReadOnlyUnder("rename", oldName); err != nil {
 		return err
 	}
 	if err := vfs.checkNotReadOnly("rename over", newName); err != nil {
@@ -761,7 +781,7 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 
 // Remove removes the named file or (empty) directory.
 func (vfs *VFS) Remove(name string) error {
-	if err := vfs.checkNotReadOnly("remove", name); err != nil {
+	if err := vfs.checkNotReadOnlyUnder("remove", name); err != nil {
 		return err
 	}
 	node, err := vfs.Stat(name)
