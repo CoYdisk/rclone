@@ -769,3 +769,67 @@ func TestItemHandleCachingReopenDuringGraceClose(t *testing.T) {
 	}
 	item.mu.Unlock()
 }
+
+// setCacheFileReadOnly makes the backing cache file read only (or
+// writable again) in a cross platform way. On Windows this sets the
+// FILE_ATTRIBUTE_READONLY flag, on Unix it clears the write bits.
+func setCacheFileReadOnly(t *testing.T, path string, readOnly bool) {
+	perm := os.FileMode(0600)
+	if readOnly {
+		perm = 0400
+	}
+	require.NoError(t, os.Chmod(path, perm))
+}
+
+// TestItemReadOnlyCacheFile checks that an item whose backing cache
+// file has been made read only by an external agent can still be
+// opened and read, but not written.
+//
+// This is what the ydisk client does for files which are locked by
+// another user: it makes the rclone cache copy read only so writes
+// fail, and before this test the following cold open failed with
+// "truncate: failed to open cache file: Access is denied" (rclone
+// always opened the cache file read-write), which the mount turned
+// into an I/O error so applications couldn't even read the file.
+func TestItemReadOnlyCacheFile(t *testing.T) {
+	r, c := newItemTestCache(t)
+	contents, obj, item := newFileLength(t, r, c, "readonly", 300)
+
+	// Fill the cache with the whole file
+	require.NoError(t, item.Open(obj))
+	buf := make([]byte, len(contents))
+	n, err := item.ReadAt(buf, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(contents), n)
+	require.Equal(t, contents, string(buf))
+	require.NoError(t, item.Close(nil))
+
+	// Make the cache file read only
+	cachePath := c.toOSPath("readonly")
+	setCacheFileReadOnly(t, cachePath, true)
+	defer func() { _ = os.Chmod(cachePath, 0600) }()
+
+	// A cold open must succeed and the file must be readable
+	require.NoError(t, item.Open(obj))
+	n, err = item.ReadAt(buf, 0)
+	if err == io.EOF {
+		err = nil
+	}
+	require.NoError(t, err)
+	assert.Equal(t, len(contents), n)
+	assert.Equal(t, contents, string(buf[:n]))
+
+	// Writing must fail while the cache file is read only
+	_, err = item.WriteAt([]byte("XXXX"), 0)
+	require.Error(t, err)
+
+	require.NoError(t, item.Close(nil))
+
+	// Once the file is writable again a cold open must give a
+	// writable item again
+	setCacheFileReadOnly(t, cachePath, false)
+	require.NoError(t, item.Open(obj))
+	_, err = item.WriteAt([]byte("XXXX"), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+}

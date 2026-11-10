@@ -70,6 +70,24 @@ type Item struct {
 	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
 	graceTimer      *time.Timer              // timer for delayed close after grace period
 	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	readOnly        bool                     // cache file is read only (set by an external agent) - fd is opened read only
+}
+
+// isPermissionDenied returns true if err is a permission error.
+//
+// On Windows this is ERROR_ACCESS_DENIED which is what CreateFile
+// returns when the file has the FILE_ATTRIBUTE_READONLY flag and the
+// caller asked for write access; on Unix it is EACCES/EPERM.
+func isPermissionDenied(err error) bool {
+	return err != nil && errors.Is(err, os.ErrPermission)
+}
+
+// IsReadOnly returns true if the backing cache file was read only when
+// it was opened, so the item can be read but not written.
+func (item *Item) IsReadOnly() bool {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.readOnly
 }
 
 // Info is persisted to backing store
@@ -247,6 +265,22 @@ func (item *Item) _truncate(size int64) (err error) {
 		}
 		osPath := item.c.toOSPath(item.name) // No locking in Cache
 		fd, err = file.OpenFile(osPath, oFlags, 0600)
+		if err != nil && isPermissionDenied(err) && item.info.Rs.Size() != 0 {
+			// The cache file has been made read only by an external
+			// agent (the ydisk client does this for files locked by
+			// another user). If it is already the right size there is
+			// nothing to truncate so carry on - Item.open() will fall
+			// back to opening the file read only. Without this a cold
+			// open of a read only cache file failed with "Access is
+			// denied" and applications couldn't even read the file.
+			if fi, statErr := os.Stat(osPath); statErr == nil && fi.Size() == size {
+				fs.Debugf(item.name, "vfs cache: cache file is read only and already size %d - not truncating", size)
+				item.readOnly = true
+				item.info.Size = size
+				return nil
+			}
+			return fmt.Errorf("vfs cache: truncate: read only cache file is not size %d: %w", size, err)
+		}
 		if err != nil && os.IsNotExist(err) {
 			// If the metadata has info but the file doesn't
 			// not exist then it has been externally removed
@@ -259,6 +293,7 @@ func (item *Item) _truncate(size int64) (err error) {
 		if err != nil {
 			return fmt.Errorf("vfs cache: truncate: failed to open cache file: %w", err)
 		}
+		item.readOnly = false
 
 		defer fs.CheckClose(fd, &err)
 
@@ -472,13 +507,28 @@ func (item *Item) _createFile(osPath string) (err error) {
 	item.modified = false
 	// t0 := time.Now()
 	fd, err := file.OpenFile(osPath, os.O_RDWR, 0600)
+	if err != nil && isPermissionDenied(err) {
+		// The cache file has been made read only by an external agent
+		// (the ydisk client does this for files locked by another
+		// user). Open it read only so the file can still be read -
+		// any attempt to write to it will fail.
+		fd, err = file.OpenFile(osPath, os.O_RDONLY, 0600)
+		if err == nil {
+			item.readOnly = true
+			fs.Debugf(item.name, "vfs cache: opened read only cache file read only - writes will fail")
+		}
+	} else if err == nil {
+		item.readOnly = false
+	}
 	// fs.Debugf(item.name, "OpenFile took %v", time.Since(t0))
 	if err != nil {
 		return fmt.Errorf("vfs cache item: open failed: %w", err)
 	}
-	err = file.SetSparse(fd)
-	if err != nil {
-		fs.Errorf(item.name, "vfs cache: failed to set as a sparse file: %v", err)
+	if !item.readOnly {
+		err = file.SetSparse(fd)
+		if err != nil {
+			fs.Errorf(item.name, "vfs cache: failed to set as a sparse file: %v", err)
+		}
 	}
 	item.fd = fd
 
@@ -934,6 +984,16 @@ func (item *Item) WrittenBack() bool {
 func (item *Item) _removeFile(reason string) {
 	osPath := item.c.toOSPath(item.name) // No locking in Cache
 	err := os.Remove(osPath)
+	if err != nil && isPermissionDenied(err) {
+		// The cache file has been made read only by an external agent.
+		// Clear the read only flag so we can remove it - the external
+		// agent is expected to re-apply it once the file has been
+		// fetched again.
+		if chmodErr := os.Chmod(osPath, 0600); chmodErr == nil {
+			item.readOnly = false
+			err = os.Remove(osPath)
+		}
+	}
 	if err != nil {
 		if !os.IsNotExist(err) {
 			fs.Errorf(item.name, "vfs cache: failed to remove cache file as %s: %v", reason, err)
@@ -1296,6 +1356,11 @@ func (item *Item) _updateFingerprint() {
 //
 // call with lock held
 func (item *Item) _setModTime(modTime time.Time) {
+	if item.readOnly {
+		// Can't set the modification time of a read only cache file
+		fs.Debugf(item.name, "vfs cache: not setting modification time of read only cache file")
+		return
+	}
 	fs.Debugf(item.name, "vfs cache: setting modification time to %v", modTime)
 	osPath := item.c.toOSPath(item.name) // No locking in Cache
 	err := os.Chtimes(osPath, modTime, modTime)
@@ -1400,6 +1465,14 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 		item.mu.Unlock()
 		return 0, errors.New("vfs cache item WriteAt: internal error: didn't Open file")
 	}
+	if item.readOnly {
+		// The cache file is read only (the ydisk client makes it read
+		// only for files locked by another user) so the write has to be
+		// refused. Log at ERROR level so the client can tell the user.
+		item.mu.Unlock()
+		fs.Errorf(item.name, "vfs cache: write refused - cache file is read only")
+		return 0, fmt.Errorf("vfs cache: write refused: cache file is read only: %w", os.ErrPermission)
+	}
 	item.mu.Unlock()
 	// Do the writing with Item.mu unlocked
 	n, err = item.fd.WriteAt(b, off)
@@ -1464,6 +1537,10 @@ func (item *Item) WriteAtNoOverwrite(b []byte, off int64) (n int, skipped int, e
 		} else {
 			// if range not present then we want to write it
 			// fs.Debugf(item.name, "write chunk offset=%d size=%d", off, size)
+			if item.readOnly {
+				err = fmt.Errorf("vfs cache: can't fetch missing data: cache file is read only: %w", os.ErrPermission)
+				break
+			}
 			nn, err = item.fd.WriteAt(b[:size], off)
 			if err == nil && nn != size {
 				err = fmt.Errorf("downloader: short write: tried to write %d but only %d written", size, nn)
