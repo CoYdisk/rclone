@@ -75,6 +75,28 @@ func TestHandleHTTPErrorNotifiesRetryableStatuses(t *testing.T) {
 	}
 }
 
+// TestHandleHTTPErrorNotifyBodyDelimitsPath 钉住正文里路径的界定。
+//
+// 现场（2026-11-13）用户看到的是 `11111/: 请先进入具体空间，再创建文件夹。`
+// 冒号前那段是**远端路径**，但没有任何界定、像错误码，用户当场问"前面的 1111 是怎么回事"。
+// 现在正文拼成 `「11111/」: …`（语言中立、不引入新文案）。
+func TestHandleHTTPErrorNotifyBodyDelimitsPath(t *testing.T) {
+	var records []string
+	defer stubNotify(&records)()
+	f := &Fs{opt: Options{DesktopNotify: true}}
+
+	err := &api.Error{StatusCode: http.StatusForbidden, Message: "请先进入具体空间，再创建文件夹。"}
+	_ = f.handleHTTPError(context.Background(), err, "11111/", "mkdir")
+
+	if len(records) != 1 {
+		t.Fatalf("期望正好 1 条通知，实际 %d 条 %v", len(records), records)
+	}
+	want := "alert|悦库企业网盘 - 权限被拒绝|「11111/」: 请先进入具体空间，再创建文件夹。"
+	if records[0] != want {
+		t.Fatalf("通知正文不符\n期望 %q\n实际 %q", want, records[0])
+	}
+}
+
 // TestHandleHTTPErrorNotifiesDisabled 关掉开关后一条都不许发（真机排查时才不会被噪音误导）
 func TestHandleHTTPErrorNotifiesDisabled(t *testing.T) {
 	var records []string

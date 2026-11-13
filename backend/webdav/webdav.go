@@ -376,7 +376,10 @@ func (f *Fs) handleHTTPError(ctx context.Context, err error, remote string, op s
 	}
 
 	// Build a sanitized notification body (remote path + detail, both URL-decoded, XML-stripped, truncated).
-	notifyBody := sanitizeNotifyMsg(remote + ": " + detailMsg)
+	// The path is wrapped in 「」 so it reads as a path rather than as an error
+	// code: the user saw "11111/: 请先进入具体空间，再创建文件夹。" and asked what
+	// "1111" was.
+	notifyBody := sanitizeNotifyMsg("「" + remote + "」: " + detailMsg)
 
 	switch apiErr.StatusCode {
 	case http.StatusForbidden:

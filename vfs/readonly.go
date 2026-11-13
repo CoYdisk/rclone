@@ -3,6 +3,7 @@ package vfs
 import (
 	"encoding/json"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -42,10 +43,22 @@ func defaultReadOnlyPathsFile(configPath string) string {
 // file.
 //
 //	{
-//	    "paths": ["dir/sub/file.docx", "other/file.xlsx"]
+//	    "paths": ["dir/sub/file.docx", "other/file.xlsx"],
+//	    "prefixes": ["", "我的空间", "协同空间"]
 //	}
+//
+// Prefixes are "protected containers": the directory itself may not be
+// created, removed or renamed, and neither may anything directly inside
+// it. Everything strictly deeper is left alone, so a real space
+// ("协同空间/<space>/…") stays writable. An empty string means the mount
+// root, ie "nothing may be created in the root".
+//
+// The field is optional: a manifest with only "paths" behaves exactly
+// as before, and an rclone which doesn't know about prefixes ignores
+// the key.
 type readOnlyPathsManifest struct {
-	Paths []string `json:"paths"`
+	Paths    []string `json:"paths"`
+	Prefixes []string `json:"prefixes"`
 }
 
 // readOnlyPaths is a set of paths (relative to the root of the VFS,
@@ -69,7 +82,8 @@ type readOnlyPaths struct {
 	size     int64     // size of file when last read
 	modTime  time.Time // modification time of file when last read
 	set      map[string]struct{}
-	lastErr  string // last error to avoid spamming the log
+	prefixes map[string]struct{} // protected container directories ("" = the mount root)
+	lastErr  string              // last error to avoid spamming the log
 }
 
 // newReadOnlyPaths returns a readOnlyPaths for the file passed in, or
@@ -79,8 +93,9 @@ func newReadOnlyPaths(filePath string) *readOnlyPaths {
 		return nil
 	}
 	return &readOnlyPaths{
-		path: filePath,
-		set:  map[string]struct{}{},
+		path:     filePath,
+		set:      map[string]struct{}{},
+		prefixes: map[string]struct{}{},
 	}
 }
 
@@ -107,10 +122,11 @@ func (r *readOnlyPaths) reload(now time.Time) {
 	if err != nil {
 		if r.loaded && os.IsNotExist(err) {
 			// File has gone - treat as empty set
-			if len(r.set) != 0 {
+			if len(r.set) != 0 || len(r.prefixes) != 0 {
 				fs.Debugf(nil, "vfs: read only paths file %q has gone - clearing read only paths", r.path)
 			}
 			r.set = map[string]struct{}{}
+			r.prefixes = map[string]struct{}{}
 			r.loaded = true
 			r.size = 0
 			r.modTime = time.Time{}
@@ -148,12 +164,26 @@ func (r *readOnlyPaths) reload(now time.Time) {
 			set[p] = struct{}{}
 		}
 	}
+	prefixes := make(map[string]struct{}, len(manifest.Prefixes))
+	for _, p := range manifest.Prefixes {
+		/*
+		 * "" is a legal value meaning the mount root - the semantic is
+		 * "nothing may be created in the root". It must not be dropped
+		 * the way cleanReadOnlyPath drops empty paths for "paths".
+		 */
+		if p == "" || cleanReadOnlyPath(p) == "" {
+			prefixes[""] = struct{}{}
+			continue
+		}
+		prefixes[cleanReadOnlyPath(p)] = struct{}{}
+	}
 	r.set = set
+	r.prefixes = prefixes
 	r.loaded = true
 	r.size = fi.Size()
 	r.modTime = fi.ModTime()
 	r.lastErr = ""
-	fs.Debugf(nil, "vfs: read only paths set to %d paths from %q", len(set), r.path)
+	fs.Debugf(nil, "vfs: read only paths set to %d paths and %d prefixes from %q", len(set), len(prefixes), r.path)
 }
 
 // Contains returns true if name is in the read only set.
@@ -200,6 +230,56 @@ func (r *readOnlyPaths) ContainsUnder(name string) bool {
 		}
 	}
 	return false
+}
+
+// ContainsContainer reports whether name itself is a protected container
+// directory: such a directory may not be created, removed or renamed.
+//
+// The mount root ("") is never a container itself, though it may be a
+// prefix meaning "nothing may be created in the root" - use
+// ContainsContainerParent for that.
+func (r *readOnlyPaths) ContainsContainer(name string) bool {
+	if r == nil {
+		return false
+	}
+	name = cleanReadOnlyPath(name)
+	if name == "" {
+		return false // the root itself is never a container
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reload(time.Now())
+	_, found := r.prefixes[name]
+	return found
+}
+
+// ContainsContainerParent reports whether name may not be created,
+// removed or renamed because it sits directly inside a protected
+// container. name itself being a protected container also counts, since
+// removing/renaming the container is refused too.
+//
+// The comparison is per path segment: a prefix of "协同空间/test" does
+// not touch "协同空间/test2".
+func (r *readOnlyPaths) ContainsContainerParent(name string) bool {
+	if r == nil {
+		return false
+	}
+	name = cleanReadOnlyPath(name)
+	if name == "" {
+		return false
+	}
+	if r.ContainsContainer(name) {
+		return true
+	}
+	parent := path.Dir(name)
+	if parent == "." {
+		parent = "" // the mount root
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reload(time.Now())
+	_, found := r.prefixes[parent]
+	return found
 }
 
 // Len returns the number of paths in the read only set (after

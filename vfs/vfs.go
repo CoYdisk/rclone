@@ -188,7 +188,7 @@ type VFS struct {
 	usageTime   time.Time
 	usage       *fs.Usage
 	pollChan    chan time.Duration
-	inUse       atomic.Int32 // count of number of opens
+	inUse       atomic.Int32   // count of number of opens
 	readOnlySet *readOnlyPaths // paths which must not be modified - may be nil
 }
 
@@ -591,6 +591,11 @@ func (vfs *VFS) OpenFile(name string, flags int, perm os.FileMode) (fd Handle, e
 		if err := vfs.checkNotReadOnly("open for write", name); err != nil {
 			return nil, err
 		}
+		// ... and not inside a protected container either (creating a
+		// file in the mount root or in a space group directory).
+		if err := vfs.checkNotInReadOnlyContainer("open for write", name); err != nil {
+			return nil, err
+		}
 	}
 
 	node, err := vfs.Stat(name)
@@ -665,6 +670,34 @@ func (vfs *VFS) checkNotReadOnlyUnder(op string, name string) error {
 	return EPERM
 }
 
+// checkNotInReadOnlyContainer returns an error (and logs it) if name may
+// not be created, removed or renamed because it is a protected container
+// directory or sits directly inside one.
+//
+// Containers come from the "prefixes" key of the read only paths file:
+// the client asks for the mount root and the space group directories to
+// be protected, because nothing may be created there (the server refuses
+// it anyway). Everything strictly deeper - a real space - is left alone.
+func (vfs *VFS) checkNotInReadOnlyContainer(op string, name string) error {
+	if vfs.readOnlySet == nil || !vfs.readOnlySet.ContainsContainerParent(name) {
+		return nil
+	}
+	fs.Errorf(name, "vfs: refusing to %s: path is in a read only container (read only prefixes list)", op)
+	return EPERM
+}
+
+// checkNotReadOnlyContainerItself is like checkNotInReadOnlyContainer
+// but only refuses the protected container directory itself - used where
+// the children must stay allowed, ie changing the modtime (a file inside
+// a space, which is how Office saves, must keep working).
+func (vfs *VFS) checkNotReadOnlyContainerItself(op string, name string) error {
+	if vfs.readOnlySet == nil || !vfs.readOnlySet.ContainsContainer(name) {
+		return nil
+	}
+	fs.Errorf(name, "vfs: refusing to %s: path is a read only container (read only prefixes list)", op)
+	return EPERM
+}
+
 // Rename oldName to newName
 func (vfs *VFS) Rename(oldName, newName string) error {
 	// Refuse to rename a read only path or to rename anything over a
@@ -675,6 +708,14 @@ func (vfs *VFS) Rename(oldName, newName string) error {
 		return err
 	}
 	if err := vfs.checkNotReadOnly("rename over", newName); err != nil {
+		return err
+	}
+	// A protected container may not be renamed, moved out of, or moved
+	// into - both ends have to be checked.
+	if err := vfs.checkNotInReadOnlyContainer("rename", oldName); err != nil {
+		return err
+	}
+	if err := vfs.checkNotInReadOnlyContainer("rename over", newName); err != nil {
 		return err
 	}
 
@@ -791,6 +832,9 @@ func (vfs *VFS) Remove(name string) error {
 	if err := vfs.checkNotReadOnlyUnder("remove", name); err != nil {
 		return err
 	}
+	if err := vfs.checkNotInReadOnlyContainer("remove", name); err != nil {
+		return err
+	}
 	node, err := vfs.Stat(name)
 	if err != nil {
 		return err
@@ -809,6 +853,11 @@ func (vfs *VFS) Remove(name string) error {
 // time unit.
 func (vfs *VFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	if err := vfs.checkNotReadOnly("set modification time", name); err != nil {
+		return err
+	}
+	// Only the container itself is refused here: files inside a space
+	// keep their mtime writable, which is what Office saving relies on.
+	if err := vfs.checkNotReadOnlyContainerItself("set modification time", name); err != nil {
 		return err
 	}
 	node, err := vfs.Stat(name)
@@ -834,6 +883,10 @@ func (vfs *VFS) mkdir(name string, perm os.FileMode) (*Dir, error) {
 
 // Mkdir creates a new directory with the specified name and permission bits
 // (before umask).
+//
+// The protected container check lives in Dir.Mkdir - which cmount calls
+// directly for MKCOL - and it runs after its "already exists" branch, so
+// a mkdir of an existing container stays idempotent.
 func (vfs *VFS) Mkdir(name string, perm os.FileMode) error {
 	_, err := vfs.mkdir(name, perm)
 	return err

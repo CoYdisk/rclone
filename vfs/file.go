@@ -482,6 +482,11 @@ func (f *File) SetModTime(modTime time.Time) error {
 	if err := f.d.vfs.checkNotReadOnly("set modification time", f._path()); err != nil {
 		return err
 	}
+	// Only the container itself is refused, never a file inside a space
+	// (Office saving an existing file sets its mtime).
+	if err := f.d.vfs.checkNotReadOnlyContainerItself("set modification time", f._path()); err != nil {
+		return err
+	}
 
 	f.pendingModTime = modTime
 
@@ -646,6 +651,11 @@ func (f *File) openWrite(flags int) (fh *WriteFileHandle, err error) {
 	if err := d.vfs.checkNotReadOnly("open for write", f.Path()); err != nil {
 		return nil, err
 	}
+	// cmount opens an existing file straight here (CreateEx returns the
+	// existing node), so the container rule has to be applied here too.
+	if err := d.vfs.checkNotInReadOnlyContainer("open for write", f.Path()); err != nil {
+		return nil, err
+	}
 	// fs.Debugf(f.Path(), "File.openWrite")
 
 	fh, err = newWriteFileHandle(d, f, f.Path(), flags)
@@ -670,6 +680,9 @@ func (f *File) openRW(flags int) (fh *RWFileHandle, err error) {
 	}
 	if flags&accessModeMask != os.O_RDONLY {
 		if err := d.vfs.checkNotReadOnly("open for write", f.Path()); err != nil {
+			return nil, err
+		}
+		if err := d.vfs.checkNotInReadOnlyContainer("open for write", f.Path()); err != nil {
 			return nil, err
 		}
 	}

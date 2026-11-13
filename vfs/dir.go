@@ -983,6 +983,10 @@ func (d *Dir) SetModTime(modTime time.Time) error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	// A protected container itself may not be modified at all.
+	if err := d.vfs.checkNotReadOnlyContainerItself("set modification time", d.path); err != nil {
+		return err
+	}
 	d.modTimeMu.Lock()
 	d.modTime = modTime
 	d.modTimeMu.Unlock()
@@ -1090,6 +1094,16 @@ func (d *Dir) Create(name string, flags int) (*File, error) {
 	if d.vfs.Opt.ReadOnly {
 		return nil, EROFS
 	}
+	// A *new* file may not be created in a protected container (the mount
+	// root or a space group directory). Creating a file which already
+	// exists stays idempotent (the existing node is returned above), but
+	// the write handle it is opened with is refused by
+	// File.openWrite/openRW - so cmount's CreateEx still fails on the
+	// open. This is the entry point used by cmount (CreateEx) as well as
+	// by VFS.OpenFile, so it has to be checked here too.
+	if err = d.vfs.checkNotInReadOnlyContainer("create", path.Join(d.path, name)); err != nil {
+		return nil, err
+	}
 	if err = d.SetModTime(time.Now()); err != nil {
 		fs.Errorf(d, "Dir.Create failed to set modtime on parent dir: %v", err)
 		return nil, err
@@ -1119,6 +1133,13 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		fs.Errorf(d, "Dir.Mkdir failed to read directory: %v", err)
 		return nil, err
 	}
+	// Creating a *new* directory in a protected container is refused here
+	// (an existing one was returned above, so mkdir stays idempotent).
+	// cmount - the mount used on Windows, ie the virtual disk - calls
+	// Dir.Mkdir directly for MKCOL, so it has to be checked here.
+	if err := d.vfs.checkNotInReadOnlyContainer("mkdir", path); err != nil {
+		return nil, err
+	}
 	// fs.Debugf(path, "Dir.Mkdir")
 	err = d.f.Mkdir(d.vfs.ctx, path)
 	if err != nil {
@@ -1142,6 +1163,9 @@ func (d *Dir) Remove() error {
 		return EROFS
 	}
 	if err := d.vfs.checkNotReadOnlyUnder("remove directory", d.path); err != nil {
+		return err
+	}
+	if err := d.vfs.checkNotInReadOnlyContainer("remove directory", d.path); err != nil {
 		return err
 	}
 	// Check directory is empty first
@@ -1175,6 +1199,9 @@ func (d *Dir) RemoveAll() error {
 	if err := d.vfs.checkNotReadOnlyUnder("remove directory", d.path); err != nil {
 		return err
 	}
+	if err := d.vfs.checkNotInReadOnlyContainer("remove directory", d.path); err != nil {
+		return err
+	}
 	// Remove contents of the directory
 	nodes, err := d.ReadDirAll()
 	if err != nil {
@@ -1206,6 +1233,11 @@ func (d *Dir) RemoveName(name string) error {
 	if err := d.vfs.checkNotReadOnlyUnder("remove", path.Join(d.path, name)); err != nil {
 		return err
 	}
+	// Removing an entry of a protected container is refused (cmount
+	// Unlink/Rmdir come straight here).
+	if err := d.vfs.checkNotInReadOnlyContainer("remove", path.Join(d.path, name)); err != nil {
+		return err
+	}
 	// fs.Debugf(path, "Dir.Remove")
 	node, err := d.stat(name)
 	if err != nil {
@@ -1233,6 +1265,14 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		return err
 	}
 	if err := d.vfs.checkNotReadOnly("rename over", newPath); err != nil {
+		return err
+	}
+	// Neither end may be a protected container (renaming the container
+	// itself, moving it out of its parent, or moving something into it).
+	if err := d.vfs.checkNotInReadOnlyContainer("rename", oldPath); err != nil {
+		return err
+	}
+	if err := d.vfs.checkNotInReadOnlyContainer("rename over", newPath); err != nil {
 		return err
 	}
 	// fs.Debugf(oldPath, "Dir.Rename to %q", newPath)
